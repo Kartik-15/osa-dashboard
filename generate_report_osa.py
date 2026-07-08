@@ -1,4 +1,320 @@
-<!DOCTYPE html>
+"""
+OSA Shelf Availability Report Generator
+Reads from Dump Tables/Before and Dump Tables/After (kpi_927 OSA + gallery dump files).
+Produces index_osa.html (embedded data) and tool_osa.html (upload shell).
+
+Schema:
+  OSA files  — shop_name, class_name, competition, On_Shelf_Availability, audit_date
+  Gallery    — store_name, image_id, image_link
+  Presence   — On_Shelf_Availability == 1  (0 = absent, 1 = present)
+  Self-SKUs  — competition == "self"
+"""
+
+import sys
+import json
+from collections import defaultdict, Counter
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import quote as _url_quote
+
+_VIEWER_PREFIX = "https://view.shelfwatch.io/?url="
+
+def _viewer_url(url):
+    if url.startswith(_VIEWER_PREFIX):
+        return url
+    return _VIEWER_PREFIX + _url_quote(url, safe="")
+
+BASE        = Path(__file__).parent / "Dump Tables"
+BEFORE_OSA  = BASE / "Before" / "kpi_927_onshelfavailability - Before.xlsx"
+AFTER_OSA   = BASE / "After"  / "kpi_927_onshelfavailability - After.xlsx"
+BEFORE_GAL  = BASE / "Before" / "kpi_927_gallery_dump.xlsx"
+AFTER_GAL   = BASE / "After"  / "kpi_927_gallerydump - After.xlsx"
+OUTPUT_HTML = Path(__file__).parent / "index_osa.html"
+TOOL_HTML   = Path(__file__).parent / "tool_osa.html"
+
+
+_DATE_FMTS = ["%Y-%m-%d", "%d %b %y", "%d %B %y", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y", "%d-%b-%y"]
+
+def _parse_date(s):
+    for fmt in _DATE_FMTS:
+        try:
+            return datetime.strptime(str(s), fmt)
+        except ValueError:
+            pass
+    return datetime.min
+
+
+def _normalize_date(d):
+    """Return YYYY-MM-DD string from datetime object, ISO string, or Excel serial int."""
+    if d is None:
+        return "Unknown"
+    if hasattr(d, "strftime"):
+        return d.strftime("%Y-%m-%d")
+    # Excel serial date: integer or float (openpyxl sometimes skips date conversion in read_only)
+    if isinstance(d, (int, float)) and 40000 < d < 60000:
+        from datetime import timedelta
+        return (datetime(1899, 12, 30) + timedelta(days=int(d))).strftime("%Y-%m-%d")
+    s = str(d)
+    if "T" in s:          # "2026-04-15T00:00:00.000Z"
+        return s[:10]
+    if len(s) >= 10:
+        return s[:10]
+    return s
+
+
+def load_xlsx(path):
+    try:
+        import openpyxl
+    except ImportError:
+        sys.exit("pip install openpyxl")
+    print(f"  Loading {path.name} …", flush=True)
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    # Pick the sheet with the most non-None header columns; avoids pivot summary sheets
+    # that may appear first when Excel re-saves the file.
+    best_name, best_count = wb.sheetnames[0], 0
+    for sn in wb.sheetnames:
+        first_row = next(wb[sn].rows, None)
+        n = sum(1 for c in first_row if c.value is not None) if first_row else 0
+        if n > best_count:
+            best_count, best_name = n, sn
+    ws = wb[best_name]
+    it = ws.rows
+    headers = [c.value for c in next(it)]
+    records = [dict(zip(headers, [c.value for c in r])) for r in it]
+    wb.close()
+    print(f"    → {len(records):,} rows", flush=True)
+    return records
+
+
+def compute_kpis(osa_records, gallery_records):
+    """
+    Returns one store entry per (store, audit_date) visit — no pooling.
+    Per-visit metrics (n_self_skus, n_images, links, SKU pills) reflect only
+    that visit's data. KPI cards use unique-store counts.
+    """
+    store_meta      = {}
+    store_dates     = defaultdict(set)                            # store → set of date strings
+    store_date_self = defaultdict(lambda: defaultdict(set))       # store → date → self SKUs present
+    store_date_comp = defaultdict(lambda: defaultdict(set))       # store → date → comp SKUs present
+    date_total      = defaultdict(set)                            # date → all stores audited
+    date_has_self   = defaultdict(set)                            # date → stores with ≥1 self SKU
+    all_self        = set()
+    all_comp        = set()
+    project_names   = Counter()
+
+    for r in osa_records:
+        store      = r.get("shop_name") or "Unknown"
+        class_name = r.get("class_name")
+        comp       = r.get("competition")
+        osa        = r.get("On_Shelf_Availability")
+        audit_date = r.get("audit_date")
+        category   = r.get("category_name") or ""
+
+        date_str = _normalize_date(audit_date)
+
+        if category:
+            project_names[category] += 1
+
+        if store not in store_meta:
+            store_meta[store] = {
+                "shop_id":   r.get("shop_id"),
+                "client_id": r.get("client_shop_id"),
+            }
+
+        store_dates[store].add(date_str)
+        date_total[date_str].add(store)
+
+        if not class_name or class_name == "Others":
+            continue
+
+        is_present = (osa == 1 or osa == 1.0)
+
+        if comp == "self":
+            all_self.add(class_name)
+            if is_present:
+                store_date_self[store][date_str].add(class_name)
+                date_has_self[date_str].add(store)
+        elif comp == "competitor":
+            all_comp.add(class_name)
+            if is_present:
+                store_date_comp[store][date_str].add(class_name)
+
+    # Gallery: date-specific lookups by client_id and by store name (no cross-date mixing)
+    gal_date_links_by_cid   = defaultdict(lambda: defaultdict(list))  # cid → date → [links]
+    gal_date_images_by_cid  = defaultdict(lambda: defaultdict(set))   # cid → date → {image_ids}
+    gal_date_links_by_name  = defaultdict(lambda: defaultdict(list))  # name → date → [links]
+    gal_date_images_by_name = defaultdict(lambda: defaultdict(set))   # name → date → {image_ids}
+
+    for r in gallery_records:
+        store_name = str(r.get("store_name") or "")
+        client_id  = str(r.get("client_store_id") or "")
+        image_id   = r.get("image_id")
+        image_link = r.get("image_link")
+        gal_date   = _normalize_date(r.get("audit_date"))
+
+        if client_id:
+            if image_id:
+                gal_date_images_by_cid[client_id][gal_date].add(image_id)
+            if image_link:
+                lst = gal_date_links_by_cid[client_id][gal_date]
+                vurl = _viewer_url(image_link)
+                if vurl not in lst:
+                    lst.append(vurl)
+
+        if store_name:
+            if image_id:
+                gal_date_images_by_name[store_name][gal_date].add(image_id)
+            if image_link:
+                vurl = _viewer_url(image_link)
+                lst = gal_date_links_by_name[store_name][gal_date]
+                if vurl not in lst:
+                    lst.append(vurl)
+
+    total  = len(store_meta)
+    sn     = sorted(all_self)
+    cn     = sorted(all_comp)
+    si     = {s: i for i, s in enumerate(sn)}
+    ci_idx = {s: i for i, s in enumerate(cn)}
+
+    # SKU presence: union across all visits per unique store (for SKU table rates)
+    sku_stores      = defaultdict(set)
+    comp_sku_stores = defaultdict(set)
+
+    # One row per (store, audit_date) visit
+    stores = []
+    for store, meta in store_meta.items():
+        cid            = str(meta.get("client_id") or "")
+        dates_sorted   = sorted(store_dates[store], key=_parse_date)
+        store_n_visits = len(dates_sorted)
+
+        for date_str in dates_sorted:
+            v_self = store_date_self[store].get(date_str, set())
+            v_comp = store_date_comp[store].get(date_str, set())
+
+            for sku in v_self:
+                sku_stores[sku].add(store)
+            for sku in v_comp:
+                comp_sku_stores[sku].add(store)
+
+            # Images — date-specific only; no cross-date contamination
+            if cid:
+                date_imgs = gal_date_images_by_cid[cid].get(date_str, set())
+                date_lnks = gal_date_links_by_cid[cid].get(date_str, [])
+            else:
+                date_imgs, date_lnks = set(), []
+
+            if not date_imgs and store in gal_date_images_by_name:
+                date_imgs = gal_date_images_by_name[store].get(date_str, set())
+                date_lnks = gal_date_links_by_name[store].get(date_str, [])
+
+            stores.append({
+                "name":        store,
+                "date":        date_str,      # this visit's specific audit date
+                "dates":       [date_str],    # kept for JS s.dates compatibility
+                "shop_id":     meta["shop_id"],
+                "client_id":   meta["client_id"],
+                "n_self_skus": len(v_self),
+                "n_comp_skus": len(v_comp),
+                "n_images":    len(date_imgs),
+                "n_visits":    store_n_visits,  # total visits for this store
+                "si":          sorted(si[s] for s in v_self if s in si),
+                "ci":          sorted(ci_idx[s] for s in v_comp if s in ci_idx)[:10],
+                "links":       date_lnks[:3],   # capped — used for UI thumbnail preview
+                "all_links":   date_lnks,       # full list — used for per-image export
+            })
+
+    stores.sort(key=lambda x: (-x["n_self_skus"], x["name"], x["date"]))
+
+    self_skus = [
+        {"sku": s, "stores": len(sku_stores[s]),
+         "rate": round(100 * len(sku_stores[s]) / total, 1)}
+        for s in sorted(sku_stores, key=lambda x: -len(sku_stores[x]))
+    ]
+    comp_skus = [
+        {"sku": s, "stores": len(comp_sku_stores[s]),
+         "rate": round(100 * len(comp_sku_stores[s]) / total, 1)}
+        for s in sorted(comp_sku_stores, key=lambda x: -len(comp_sku_stores[x]))
+    ]
+
+    dist      = Counter(s["n_self_skus"] for s in stores)
+    histogram = [{"bucket": k, "count": dist[k]} for k in sorted(dist)]
+
+    dates_sorted_all = sorted(date_total.keys(), key=_parse_date)
+    date_trend = []
+    for d in dates_sorted_all:
+        t = len(date_total[d])
+        h = len(date_has_self[d])
+        date_trend.append({
+            "date": d, "stores_visited": t, "stores_with_brunch": h,
+            "rate": round(100 * h / t, 1) if t else 0,
+        })
+
+    date_range = f"{dates_sorted_all[0]} – {dates_sorted_all[-1]}" if dates_sorted_all else ""
+
+    # Unique stores with ≥1 self SKU on any visit
+    sw = sum(1 for store in store_meta
+             if any(store_date_self[store].get(d) for d in store_dates[store]))
+
+    return {
+        "project_name":       project_names.most_common(1)[0][0] if project_names else "Availability Report",
+        "date_range":         date_range,
+        "total_stores":       total,
+        "total_visits":       len(stores),
+        "stores_with_brunch": sw,
+        "stores_no_brunch":   total - sw,
+        "overall_avail_rate": round(100 * sw / total, 1) if total else 0,
+        "total_self_skus":    len(all_self),
+        "total_comp_skus":    len(all_comp),
+        "sku_names":          sn,
+        "comp_names":         cn,
+        "stores":             stores,
+        "self_skus":          self_skus,
+        "comp_skus":          comp_skus,
+        "histogram":          histogram,
+        "date_trend":         date_trend,
+    }
+
+
+def compute_delta(before, after):
+    # Multiple rows per store — aggregate by max n_self_skus across all visits
+    bm = defaultdict(int)
+    for s in before["stores"]:
+        bm[s["name"]] = max(bm[s["name"]], s["n_self_skus"])
+    am = defaultdict(int)
+    for s in after["stores"]:
+        am[s["name"]] = max(am[s["name"]], s["n_self_skus"])
+    all_names = set(bm) | set(am)
+    store_deltas = sorted(
+        [{"name": n,
+          "before": bm.get(n, 0),
+          "after":  am.get(n, 0),
+          "delta":  am.get(n, 0) - bm.get(n, 0)}
+         for n in all_names],
+        key=lambda x: x["delta"]
+    )
+    sb = {s["sku"]: s["rate"] for s in before["self_skus"]}
+    sa = {s["sku"]: s["rate"] for s in after["self_skus"]}
+    sku_deltas = sorted(
+        [{"sku": u, "before": sb.get(u, 0), "after": sa.get(u, 0),
+          "delta": round(sa.get(u, 0) - sb.get(u, 0), 1)}
+         for u in set(sb) | set(sa)],
+        key=lambda x: x["delta"]
+    )
+    return {
+        "avail_before": before["overall_avail_rate"],
+        "avail_after":  after["overall_avail_rate"],
+        "avail_delta":  round(after["overall_avail_rate"] - before["overall_avail_rate"], 1),
+        "store_deltas": store_deltas,
+        "sku_deltas":   sku_deltas,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML — single file, two modes:
+#   DATA_MODE  : Python embedded payload, shows dashboard immediately
+#   UPLOAD_MODE: No payload, shows file upload + column mapper first
+# ─────────────────────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -544,7 +860,7 @@ tr.sku-row-active{background:rgba(245,166,35,.07)!important;border-left:2px soli
 
 <script>
 // ── embedded data (null when shell/upload-mode) ────────────────────────────────
-const EMBED = {"has_after": false, "before": null, "after": null, "delta": null};
+const EMBED = __DATA_JSON__;
 
 // ── active data globals (replaced when user uploads) ─────────────────────────
 let B = null, A = null, D = null, HAS_AFTER = false;
@@ -1500,3 +1816,59 @@ parse_Primary(n.content)}catch(l){}a="/EncryptionInfo";n=Qe.find(e,a);if(!n||!n.
 </script>
 </body>
 </html>
+"""
+
+
+def main():
+    print("OSA Shelf Availability Report Generator")
+    print("=" * 40)
+
+    if not BEFORE_OSA.exists():
+        sys.exit(f"ERROR: Before OSA file not found:\n  {BEFORE_OSA}")
+    if not BEFORE_GAL.exists():
+        sys.exit(f"ERROR: Before gallery file not found:\n  {BEFORE_GAL}")
+
+    print("\n[1/4] Loading Before OSA …")
+    bef_osa = load_xlsx(BEFORE_OSA)
+
+    print("\n[2/4] Loading Before Gallery …")
+    bef_gal = load_xlsx(BEFORE_GAL)
+
+    print("\n      Computing Before KPIs …")
+    bef = compute_kpis(bef_osa, bef_gal)
+    print(f"      {bef['project_name']} | {bef['date_range']}")
+    print(f"      Availability: {bef['overall_avail_rate']}% | Stores: {bef['total_stores']} | SKUs: {bef['total_self_skus']}")
+
+    has_after = AFTER_OSA.exists() and AFTER_GAL.exists()
+    aft = delta = None
+    if has_after:
+        print("\n[3/4] Loading After OSA …")
+        aft_osa = load_xlsx(AFTER_OSA)
+        print("\n      Loading After Gallery …")
+        aft_gal = load_xlsx(AFTER_GAL)
+        print("\n      Computing After KPIs …")
+        aft = compute_kpis(aft_osa, aft_gal)
+        delta = compute_delta(bef, aft)
+        print(f"      After: {aft['overall_avail_rate']}%  Δ={delta['avail_delta']:+.1f}pp")
+    else:
+        missing = []
+        if not AFTER_OSA.exists():  missing.append(str(AFTER_OSA))
+        if not AFTER_GAL.exists():  missing.append(str(AFTER_GAL))
+        print(f"\n[3/4] After files not found:\n      " + "\n      ".join(missing))
+
+    print("\n[4/4] Writing output files …")
+    # The dashboard is a generic portal — it never ships with a project's data baked in
+    # and always starts fresh, prompting for a file upload. Before/After above are computed
+    # only so this script can print sanity-check stats to the console.
+    shell_payload = {"has_after": False, "before": None, "after": None, "delta": None}
+    html = HTML.replace("__DATA_JSON__", json.dumps(shell_payload, ensure_ascii=False))
+    OUTPUT_HTML.write_text(html, encoding="utf-8")
+    print(f"  ✓ index_osa.html  ({OUTPUT_HTML.stat().st_size // 1024} KB)  — generic upload-first shell")
+
+    tool_html = HTML.replace("__DATA_JSON__", json.dumps(shell_payload, ensure_ascii=False))
+    TOOL_HTML.write_text(tool_html, encoding="utf-8")
+    print(f"  ✓ tool_osa.html   ({TOOL_HTML.stat().st_size // 1024} KB)  — generic upload-first shell")
+
+
+if __name__ == "__main__":
+    main()
